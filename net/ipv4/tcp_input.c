@@ -77,6 +77,12 @@
 #include <asm/unaligned.h>
 #include <linux/errqueue.h>
 
+#include <perf_tracker_internal.h>
+//#ifdef OPLUS_FEATURE_NWPOWER
+//Asiga@PSW.NW.DATA.2120730, 2019/06/26, add for classify glink wakeup services and count IPA wakeup.
+#include <net/oplus_nwpower.h>
+//#endif /* OPLUS_FEATURE_NWPOWER */
+
 int sysctl_tcp_fack __read_mostly;
 int sysctl_tcp_max_reordering __read_mostly = 300;
 int sysctl_tcp_dsack __read_mostly = 1;
@@ -121,6 +127,11 @@ int sysctl_tcp_invalid_ratelimit __read_mostly = HZ/2;
 #define TCP_REMNANT (TCP_FLAG_FIN|TCP_FLAG_URG|TCP_FLAG_SYN|TCP_FLAG_PSH)
 #define TCP_HP_BITS (~(TCP_RESERVED_BITS|TCP_FLAG_PSH))
 
+//#ifdef OPLUS_FEATURE_WIFI_SLA
+//HuangJunyuan@CONNECTIVITY.WIFI.NETWORK.4502, 2018/04/10,Add code for appo sla function
+void (*statistic_dev_rtt)(struct sock *sk,long rtt) = NULL;
+EXPORT_SYMBOL(statistic_dev_rtt);
+//#endif /* OPLUS_FEATURE_WIFI_SLA */
 #define REXMIT_NONE	0 /* no loss recovery to do */
 #define REXMIT_LOST	1 /* retransmit packets marked lost */
 #define REXMIT_NEW	2 /* FRTO-style transmit of unsent/new packets */
@@ -662,6 +673,11 @@ new_measure:
 	tp->rcvq_space.time = tp->tcp_mstamp;
 }
 
+#ifdef OPLUS_FEATURE_APP_MONITOR
+/* Add code for push detect function */
+extern void oplus_app_monitor_update_app_info(struct sock *sk, const struct sk_buff *skb, int send, int retrans);
+#endif /* OPLUS_FEATURE_APP_MONITOR */
+
 /* There is something which you must keep in mind when you analyze the
  * behavior of the tp->ato delayed ack timeout interval.  When a
  * connection starts up, we want to ack as quickly as possible.  The
@@ -716,6 +732,11 @@ static void tcp_event_data_recv(struct sock *sk, struct sk_buff *skb)
 
 	if (skb->len >= 128)
 		tcp_grow_window(sk, skb);
+
+	#ifdef OPLUS_FEATURE_APP_MONITOR
+	/* Add code for push detect function */
+	oplus_app_monitor_update_app_info(sk, skb, 0, 0);
+	#endif /* OPLUS_FEATURE_APP_MONITOR */
 }
 
 /* Called to compute a smoothed rtt estimate. The data fed to this
@@ -780,6 +801,13 @@ static void tcp_rtt_estimator(struct sock *sk, long mrtt_us)
 			tp->rtt_seq = tp->snd_nxt;
 			tp->mdev_max_us = tcp_rto_min_us(sk);
 		}
+                //#ifdef OPLUS_FEATURE_WIFI_SLA
+                //HuangJunyuan@CONNECTIVITY.WIFI.NETWORK.4502, 2018/04/10,
+                //Add code for appo sla function
+                if(TCP_ESTABLISHED == sk->sk_state && NULL != statistic_dev_rtt){
+                        statistic_dev_rtt(sk,mrtt_us);
+                }
+                //#endif /* OPLUS_FEATURE_WIFI_SLA */
 	} else {
 		/* no previous measure. */
 		srtt = m << 3;		/* take the measured time to be rtt */
@@ -1225,7 +1253,7 @@ static u8 tcp_sacktag_one(struct sock *sk,
 	if (dup_sack && (sacked & TCPCB_RETRANS)) {
 		if (tp->undo_marker && tp->undo_retrans > 0 &&
 		    after(end_seq, tp->undo_marker))
-			tp->undo_retrans = max_t(int, 0, tp->undo_retrans - pcount);
+			tp->undo_retrans--;
 		if (sacked & TCPCB_SACKED_ACKED)
 			state->reord = min(fack_count, state->reord);
 	}
@@ -2803,8 +2831,7 @@ static void tcp_rack_identify_loss(struct sock *sk, int *ack_flag)
 	if (sysctl_tcp_recovery & TCP_RACK_LOSS_DETECTION) {
 		u32 prior_retrans = tp->retrans_out;
 
-		if (tcp_rack_mark_lost(sk))
-			*ack_flag &= ~FLAG_SET_XMIT_TIMER;
+		tcp_rack_mark_lost(sk);
 		if (prior_retrans > tp->retrans_out)
 			*ack_flag |= FLAG_LOST_RETRANS;
 	}
@@ -2982,6 +3009,7 @@ static bool tcp_ack_update_rtt(struct sock *sk, const int flag,
 	 * always taken together with ACK, SACK, or TS-opts. Any negative
 	 * values will be skipped with the seq_rtt_us < 0 check above.
 	 */
+	perf_update_tcp_rtt(sk, seq_rtt_us);
 	tcp_update_rtt_min(sk, ca_rtt_us);
 	tcp_rtt_estimator(sk, seq_rtt_us);
 	tcp_set_rto(sk);
@@ -3517,8 +3545,10 @@ static void tcp_replace_ts_recent(struct tcp_sock *tp, u32 seq)
 	}
 }
 
-/* This routine deals with acks during a TLP episode and ends an episode by
- * resetting tlp_high_seq. Ref: TLP algorithm in draft-ietf-tcpm-rack
+/* This routine deals with acks during a TLP episode.
+ * We mark the end of a TLP episode on receiving TLP dupack or when
+ * ack is after tlp_high_seq.
+ * Ref: loss detection algorithm in draft-dukkipati-tcpm-tcp-loss-probe.
  */
 static void tcp_process_tlp_ack(struct sock *sk, u32 ack, int flag)
 {
@@ -3527,10 +3557,7 @@ static void tcp_process_tlp_ack(struct sock *sk, u32 ack, int flag)
 	if (before(ack, tp->tlp_high_seq))
 		return;
 
-	if (!tp->tlp_retrans) {
-		/* TLP of new data has been acknowledged */
-		tp->tlp_high_seq = 0;
-	} else if (flag & FLAG_DSACKING_ACK) {
+	if (flag & FLAG_DSACKING_ACK) {
 		/* This DSACK means original and TLP probe arrived; no loss */
 		tp->tlp_high_seq = 0;
 	} else if (after(ack, tp->tlp_high_seq)) {
@@ -3689,15 +3716,14 @@ static int tcp_ack(struct sock *sk, const struct sk_buff *skb, int flag)
 
 	if (tp->tlp_high_seq)
 		tcp_process_tlp_ack(sk, ack, flag);
+	/* If needed, reset TLP/RTO timer; RACK may later override this. */
+	if (flag & FLAG_SET_XMIT_TIMER)
+		tcp_set_xmit_timer(sk);
 
 	if (tcp_ack_is_dubious(sk, flag)) {
 		is_dupack = !(flag & (FLAG_SND_UNA_ADVANCED | FLAG_NOT_DUP));
 		tcp_fastretrans_alert(sk, acked, is_dupack, &flag, &rexmit);
 	}
-
-	/* If needed, reset TLP/RTO timer when RACK doesn't set. */
-	if (flag & FLAG_SET_XMIT_TIMER)
-		tcp_set_xmit_timer(sk);
 
 	if ((flag & FLAG_FORWARD_PROGRESS) || !(flag & FLAG_NOT_DUP))
 		sk_dst_confirm(sk);
@@ -4510,11 +4536,7 @@ static void tcp_data_queue_ofo(struct sock *sk, struct sk_buff *skb)
 	if (tcp_ooo_try_coalesce(sk, tp->ooo_last_skb,
 				 skb, &fragstolen)) {
 coalesce_done:
-		/* For non sack flows, do not grow window to force DUPACK
-		 * and trigger fast retransmit.
-		 */
-		if (tcp_is_sack(tp))
-			tcp_grow_window(sk, skb);
+		tcp_grow_window(sk, skb);
 		kfree_skb_partial(skb, fragstolen);
 		skb = NULL;
 		goto add_sack;
@@ -4598,11 +4620,7 @@ add_sack:
 		tcp_sack_new_ofo_skb(sk, seq, end_seq);
 end:
 	if (skb) {
-		/* For non sack flows, do not grow window to force DUPACK
-		 * and trigger fast retransmit.
-		 */
-		if (tcp_is_sack(tp))
-			tcp_grow_window(sk, skb);
+		tcp_grow_window(sk, skb);
 		skb_condense(skb);
 		skb_set_owner_r(skb, sk);
 	}
@@ -4739,6 +4757,12 @@ queue_and_out:
 
 	if (!after(TCP_SKB_CB(skb)->end_seq, tp->rcv_nxt)) {
 		/* A retransmit, 2nd most common case.  Force an immediate ack. */
+
+		//#ifdef OPLUS_FEATURE_NWPOWER
+		//Asiga@PSW.NW.DATA.2120730, 2019/06/26, add for classify glink wakeup services and count IPA wakeup.
+		oplus_match_tcp_input_retrans(sk);
+		//#endif /* OPLUS_FEATURE_NWPOWER */
+
 		NET_INC_STATS(sock_net(sk), LINUX_MIB_DELAYEDACKLOST);
 		tcp_dsack_set(sk, TCP_SKB_CB(skb)->seq, TCP_SKB_CB(skb)->end_seq);
 
@@ -5541,8 +5565,6 @@ void tcp_rcv_established(struct sock *sk, struct sk_buff *skb,
 				tcp_data_snd_check(sk);
 				if (!inet_csk_ack_scheduled(sk))
 					goto no_ack;
-			} else {
-				tcp_update_wl(tp, TCP_SKB_CB(skb)->seq);
 			}
 
 			__tcp_ack_snd_check(sk, 0);
@@ -5696,6 +5718,17 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 	struct tcp_fastopen_cookie foc = { .len = -1 };
 	int saved_clamp = tp->rx_opt.mss_clamp;
 	bool fastopen_fail;
+        #ifdef OPLUS_BUG_STABILITY
+        //ZhaoMengqing@CONNECTIVITY.WIFI.INTERNET.1394484, 2019/04/02,add for: When find TCP SYN-ACK Timestamp value error, just do not use Timestamp
+        static int ts_error_count = 0;
+        int ts_error_threshold = sysctl_tcp_ts_control[0];
+
+        //when network change (frameworks set sysctl_tcp_ts_control[1] = 1), clear ts_error_count
+        if (sysctl_tcp_ts_control[1] == 1) {
+                ts_error_count = 0;
+                sysctl_tcp_ts_control[1] = 0;
+        }
+        #endif /* OPLUS_BUG_STABILITY */
 
 	tcp_parse_options(sock_net(sk), skb, &tp->rx_opt, 0, &foc);
 	if (tp->rx_opt.saw_tstamp && tp->rx_opt.rcv_tsecr)
@@ -5719,9 +5752,28 @@ static int tcp_rcv_synsent_state_process(struct sock *sk, struct sk_buff *skb,
 			     tcp_time_stamp(tp))) {
 			NET_INC_STATS(sock_net(sk),
 					LINUX_MIB_PAWSACTIVEREJECTED);
+                        #ifdef OPLUS_BUG_STABILITY
+			//ZhaoMengqing@CONNECTIVITY.WiFi.Network.internet.1394484, 2019/04/02,add for: When find TCP SYN-ACK Timestamp value error, just do not use Timestamp
+			//if count > threshold, disable TCP Timestamps
+			if (ts_error_threshold > 0) {
+				ts_error_count++;
+				if (ts_error_count >= ts_error_threshold) {
+					sock_net(sk)->ipv4.sysctl_tcp_timestamps = 0;
+					ts_error_count = 0;
+				}
+			}
+			#endif /* OPLUS_BUG_STABILITY */
 			goto reset_and_undo;
 		}
 
+                #ifdef OPLUS_BUG_STABILITY
+                //ZhaoMengqing@CONNECTIVITY.WiFi.Network.internet.1394484, 2019/04/02,add for: When find TCP SYN-ACK Timestamp value error, just do not use Timestamp
+                //if other connection's Timestamp is correct, the network environment may be OK
+                if (tp->rx_opt.saw_tstamp && tp->rx_opt.rcv_tsecr &&
+                    ts_error_threshold > 0 && ts_error_count > 0) {
+                    ts_error_count--;
+                }
+                #endif /* OPLUS_BUG_STABILITY */
 		/* Now ACK is acceptable.
 		 *
 		 * "If the RST bit is set

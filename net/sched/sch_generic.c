@@ -158,6 +158,17 @@ trace:
 	return skb;
 }
 
+#ifdef OPLUS_FEATURE_WIFI_LIMMITBGSPEED
+//HuangJunyuan@CONNECTIVITY.WIFI.INTERNET, 2018/06/26, Add for limit speed function
+struct sk_buff *qdisc_dequeue_skb(struct Qdisc *q, bool *validate)
+{
+	int packets;
+
+	return dequeue_skb(q, validate, &packets);
+}
+EXPORT_SYMBOL(qdisc_dequeue_skb);
+#endif /* OPLUS_FEATURE_WIFI_LIMMITBGSPEED */
+
 /*
  * Transmit possibly several skbs, and handle the return status as
  * required. Owning running seqcount bit guarantees that
@@ -341,7 +352,6 @@ void __netdev_watchdog_up(struct net_device *dev)
 			dev_hold(dev);
 	}
 }
-EXPORT_SYMBOL_GPL(__netdev_watchdog_up);
 
 static void dev_watchdog_up(struct net_device *dev)
 {
